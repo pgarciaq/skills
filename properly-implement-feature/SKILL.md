@@ -34,8 +34,12 @@ If it doesn't, note why in the final report.
 | 3 | **Update the OpenAPI spec** | New/changed API endpoints, request/response fields, status codes, or headers |
 | 4 | **Update the API cheat sheet** | New endpoints or significant behavior changes that operators/developers reference |
 | 5 | **Update the Bruno collection** | New endpoints or request patterns worth having a ready-made example for |
-| 6 | **Update internal docs** | Architecture docs, runbooks, monitoring guides, configuration docs, changelogs, known issues |
+| 6 | **Update internal docs** | Architecture docs, runbooks, monitoring guides, configuration docs, known issues |
 | 7 | **Update public website / docs-site** | Customer-facing documentation that mirrors internal docs |
+| 8 | **Write an ADR** | Architectural or design decisions with trade-offs, alternative approaches considered, or non-obvious rationale that future developers need to understand |
+| 9 | **Update the CHANGELOG** | Any user-visible change, new feature, fix, deprecation, or performance improvement |
+| 10 | **Update the ADR index** | When a new ADR is created — update both `docs/architecture/adr/README.md` and `docs-site/architecture/adrs.md` |
+| 11 | **Update the performance audit** | Only when the user explicitly asks to update the audit report, or when closing out a dedicated performance optimization phase |
 
 ### 4. Produce the completion report
 
@@ -53,6 +57,10 @@ After all tasks are done, present a summary table:
 | Bruno collection | Done / Dismissed | reason |
 | Internal docs | Done / Dismissed | reason |
 | Public website | Done / Dismissed | reason |
+| ADR | Done / Dismissed | reason |
+| CHANGELOG | Done / Dismissed | reason |
+| ADR index | Done / Dismissed | reason |
+| Performance audit | Done / Dismissed | reason |
 ```
 
 ## Decision guidelines
@@ -77,7 +85,11 @@ These paths vary by project. Search the workspace for:
 | Internal docs | `docs/`, `docs/operations/`, `docs/architecture/` |
 | Public website | `docs-site/`, `website/`, `public/docs/` |
 | E2E tests | `tests/e2e/`, `testing/`, adjacent `cost-onprem-chart/tests/` |
+| ADRs | `docs/architecture/adr/`, `docs/adr/` |
+| ADR index (internal) | `docs/architecture/adr/README.md`, `docs/adr/README.md` |
+| ADR index (public) | `docs-site/architecture/adrs.md` |
 | Changelog | `CHANGELOG.md` at repo root |
+| Performance audit | `docs/performance/` |
 
 ## Example dismissal reasons
 
@@ -86,3 +98,25 @@ These paths vary by project. Search the workspace for:
 - "Change is internal/backend-only with no user-facing behavior change" (E2E)
 - "The docs-site mirrors internal docs and both were updated" (public website)
 - "Existing E2E tests already cover this flow at sufficient granularity" (E2E)
+- "No architectural decision or trade-off was involved — straightforward bugfix" (ADR)
+- "No user-visible change — internal refactoring only" (CHANGELOG)
+- "No new ADR was created" (ADR index)
+- "Performance audit updates are done periodically, not per-feature" (performance audit)
+
+## ADR guidelines
+
+An ADR (Architecture Decision Record) should be written when:
+- A design decision involved choosing between alternatives with meaningful trade-offs
+- The rationale might not be obvious to future developers reading the code
+- The decision constrains future work or closes off alternative approaches
+- Performance, accuracy, or complexity trade-offs were made
+
+An ADR should NOT be written for:
+- Routine bugfixes with obvious causes
+- Simple refactoring with no behavioral change
+- Following established patterns without deviation
+
+When writing an ADR:
+- Follow the existing numbering convention (check the latest ADR number and increment)
+- Follow the existing format in the repo (read a recent ADR for style)
+- Always update BOTH the internal ADR index AND the public ADR page
