@@ -144,6 +144,12 @@ When updating an existing review (not starting fresh):
 5. Bump the version number and date
 6. Keep the historical record intact — append, don't rewrite
 
+## Output Location
+
+Save adversarial review reports to `docs/audit/` in the primary repository under
+review. Performance reviews go to `docs/performance/`. Do not mix audit and
+performance documents in the same directory.
+
 ## Integration with Remediation
 
 After the review, findings can be addressed using the `/properly-implement-feature`
