@@ -140,25 +140,27 @@ These are patterns that have been found repeatedly across plugins:
 - [ ] OpenAPI spec matches actual handler behavior (params, response schema)
 - [ ] Unit tests don't weaken assertions or skip to hide failures
 
-## SNO Cluster Access
+## SNO / UXSNO Cluster Access
 
-If E2E testing is needed:
+If E2E testing is needed, use whichever SNO or UXSNO cluster is currently active.
+Determine the cluster hostname by checking `oc whoami --show-server` or asking the user.
 
-- SSH: `ssh -o StrictHostKeyChecking=no root@dell-r730-031.bkr.lab.eng.rdu2.dc.redhat.com`
-- KUBECONFIG: `/root/.kcli/clusters/sno/auth/kubeconfig`
+- KUBECONFIG: use the current `oc login` session (or `/root/.kcli/clusters/sno/auth/kubeconfig` on the hypervisor)
 - Namespace: `cost-onprem`
 - Keycloak realm: `cost-management`
 - Build + deploy: `podman build`, `podman push`, `oc set image`
 
 ## Repos and Branches
 
+Always work on the **current branch** of each repo (check with `git branch --show-current`).
+Do not assume a specific branch name — it changes across phases.
 
-| Repo                    | Path                                  | Branch                                |
-| ----------------------- | ------------------------------------- | ------------------------------------- |
-| ros-ocp-backend         | `~/dev/koku/ros-ocp-backend/`         | `pgarciaq-rosocp-superpowers-phase12` |
-| costmgmt-api-cheatsheet | `~/dev/koku/costmgmt-api-cheatsheet/` | `pgarciaq-rosocp-superpowers-phase12` |
-| cost-onprem-chart       | `~/dev/koku/cost-onprem-chart/`       | `pgarciaq-rosocp-superpowers-phase12` |
-| iqe-ros-ocp-plugin      | `~/dev/koku/iqe-ros-ocp-plugin/`      | `pgarciaq-rosocp-superpowers-phase12` |
-| nise                    | `~/dev/koku/nise/`                    | `pgarciaq-rosocp-superpowers-phase12` |
+| Repo                    | Path                                  |
+| ----------------------- | ------------------------------------- |
+| ros-ocp-backend         | `~/dev/koku/ros-ocp-backend/`         |
+| costmgmt-api-cheatsheet | `~/dev/koku/costmgmt-api-cheatsheet/` |
+| cost-onprem-chart       | `~/dev/koku/cost-onprem-chart/`       |
+| iqe-ros-ocp-plugin      | `~/dev/koku/iqe-ros-ocp-plugin/`      |
+| nise                    | `~/dev/koku/nise/`                    |
 
 
