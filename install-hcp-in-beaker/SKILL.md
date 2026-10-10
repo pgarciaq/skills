@@ -1,6 +1,6 @@
 ---
 name: install-hcp-in-beaker
-description: Use when creating an OpenShift Hosted Control Planes lab on a Beaker hypervisor with kcli: KVM virtual machines, compact management cluster, Agent-platform hosted cluster with NodePool workers, assisted-service discovery ISO, HCP DNS records, and optional air-gapped metrics-operator deploy for HyperShift development and testing.
+description: Use when creating an OpenShift Hosted Control Planes lab on a Beaker hypervisor with kcli: KVM virtual machines, compact management cluster, Agent-platform hosted cluster with NodePool workers, assisted-service discovery ISO, HCP DNS records, and optional OLM-managed Cost Management metrics collection.
 ---
 
 # Install HCP in Beaker
@@ -38,6 +38,10 @@ except the live-ISO URL pattern, which parameterizes cleanly.
 | OCP minor | No | `4.22` | `4.23` |
 | Mgmt nodes | No | 3 compact × 16 vCPU / 48 GiB / 200 GiB | — |
 | Hosted workers | No | 2 × 8 vCPU / 32 GiB / 120 GiB | — |
+| Metrics operator mode | No | `olm-authenticated` or `air-gapped-validation` | — |
+| Operator planes | No | `management,hosted` in authenticated mode | — |
+| Cost Management API base | Authenticated mode | — | `https://gateway.../api/cost-management/v1` |
+| Keycloak token base | Authenticated mode | — | `https://keycloak.../realms/cost-management` |
 
 Disk defaults total 840 GB nominal (3×200 + 2×120) against the ~1 TiB pool
 assumption in the budget check, leaving little headroom on a smaller pool —
@@ -83,8 +87,9 @@ df -h / /home   # `/` matters separately: local-path-provisioner defaults to /op
   `dnf install -y podman tmux edk2-aarch64`; `kcli download oc` drops the
   binary in CWD — `mv ./oc /usr/local/bin/ && oc version --client`.
 - Operator phase only (optional, last): Quay robot with push on a repo; a
-  human runs `podman login` on the box. Tokens never transit chat, issues,
-  or files.
+  human runs `podman login` on the box. Authenticated OLM mode also needs
+  `operator-sdk`, `make`, `go`, `kustomize`, `yq`, `podman`, and `skopeo`.
+  Tokens never transit chat, issues, or files.
 
 All SSH uses `-o StrictHostKeyChecking=no`. Long runs go under
 `tmux new -s <name>` on the box. For backgrounded commands, wrap:
@@ -507,9 +512,316 @@ kubeconfig): `oc debug node/<n> -- chroot /host chronyc tracking` shows
 `Leap status: Normal` and `chronyc sources` selects `^* _gateway`. Pool-wide,
 so future workers inherit it.
 
-### Phase 10 (optional): operator for HCP validation
+### Phase 10: koku-metrics-operator modes
 
-Validates the `koku-metrics-operator` end to end on the hosted cluster:
+Choose exactly one mode before deploying the operator:
+
+| Mode | Planes | Operator install | Cost Management upload |
+|------|--------|------------------|------------------------|
+| `olm-authenticated` | Management, hosted, or both | OLM bundle/catalog | Enabled; one source per plane |
+| `air-gapped-validation` | Hosted cluster | Direct kustomize apply | Disabled; local collection/package validation only |
+
+The operator is installed **inside each target Kubernetes cluster**, not on
+individual worker VMs. Management and hosted clusters have different cluster
+IDs, Prometheus endpoints, PVCs, CRs, and Cost Management source records. Run
+the OLM install and CR configuration once per selected kubeconfig; never point
+one operator at both clusters.
+
+Do not mix the modes in one cluster. The authenticated path below is the
+supported integration with Cost Management on-prem. The air-gapped path in
+Phase 10b preserves the existing HCP/ROS validation workflow and intentionally
+does not require Keycloak or a Cost Management API.
+
+#### Phase 10a: authenticated OLM deployment
+
+Set these variables when the Cost Management on-prem stack already exists:
+
+```bash
+# [hypervisor]
+CM_GATEWAY=https://cost-onprem-gateway-cost-onprem.apps.<cm-cluster>.<domain>
+CM_API="$CM_GATEWAY/api/cost-management/v1"
+KC=https://keycloak-keycloak.apps.<cm-cluster>.<domain>
+REALM=cost-management
+KMO_NS=koku-metrics-operator
+KMO_SRC=/root/koku-metrics-operator
+KMO_TAG="w0.1-$(date -u +%Y%m%d-%H%M)"
+KMO_VERSION=4.4.1
+BUILD_PLATFORM=linux/arm64                 # use linux/amd64 on x86_64 labs
+INSTALL_MGMT=true                          # set false to skip management plane
+INSTALL_HOSTED=true                        # set false to skip hosted plane
+KMO_IMAGE="quay.io/<repo>/koku-metrics-operator:${KMO_TAG}"
+BUNDLE_IMAGE="quay.io/<repo>/koku-metrics-operator-bundle:v${KMO_VERSION}-${KMO_TAG}"
+```
+
+`CM_GATEWAY` is the gateway origin without `/api`; the CR combines it with
+`sources_path`. The exact compatibility prefix is
+`/api/cost-management/v1/`—do not use `/api/cost-management/v1/sources/`.
+
+##### Build and publish the OLM operator
+
+Build the operator natively on the Beaker hypervisor. The manager image,
+bundle image, and any catalog image must be reachable by **both** clusters;
+Quay is the simplest shared registry. A mutable tag is not sufficient: the
+generated CSV must reference the pushed manager image by digest.
+
+```bash
+# [hypervisor] native build; BUILD_PLATFORM must match the cluster nodes
+cd "$KMO_SRC"
+git rev-parse HEAD
+git status --short                         # stop if the build tree is not the agreed tree
+podman build --platform="$BUILD_PLATFORM" -t "$KMO_IMAGE" -f Dockerfile .
+test "$(podman image inspect "$KMO_IMAGE" --format '{{.Architecture}}')" \
+  = "${BUILD_PLATFORM#linux/}"
+podman push "$KMO_IMAGE"                  # human performs prior podman login
+
+IMAGE_DIGEST=$(skopeo inspect --format '{{.Digest}}' "docker://${KMO_IMAGE}")
+IMAGE_REF="${KMO_IMAGE%@*}@${IMAGE_DIGEST}"
+
+# Generate the CRDs, manager image reference, CSV, and bundle metadata from
+# this checkout. Do not patch the generated CSV after OLM installs it.
+make bundle \
+  IMG="$KMO_IMAGE" IMAGE_SHA="$IMAGE_REF" VERSION="$KMO_VERSION" \
+  NAMESPACE="$KMO_NS"
+make bundle-build CONTAINER_TOOL=podman BUNDLE_IMG="$BUNDLE_IMAGE"
+make bundle-push CONTAINER_TOOL=podman BUNDLE_IMG="$BUNDLE_IMAGE"
+```
+
+The `bundle` target is the required build step; `docker-build` alone produces
+only a manager image and cannot install an OLM operator. If the repository
+provides a catalog target, publish the catalog as well. Otherwise
+`operator-sdk run bundle` creates the temporary catalog source used below.
+
+##### Install the bundle on each selected plane
+
+Run this function once with the management kubeconfig and once with the hosted
+kubeconfig. `operator-sdk run bundle` creates the OLM Subscription/CSV; do not
+apply the old `oc apply -k config/default` deployment in authenticated mode.
+If `koku-metrics-operator` already has a Subscription/CSV, do not run a second
+bundle installation or delete the CR, Secret, or PVC; update the existing
+CatalogSource/Subscription and let OLM perform the upgrade.
+
+```bash
+install_kmo_olm() {
+  local plane=$1 kubeconfig=$2
+  export KUBECONFIG="$kubeconfig"
+
+  oc get clusterversion >/dev/null
+  oc create namespace "$KMO_NS" --dry-run=client -o yaml | oc apply -f -
+  operator-sdk run bundle "$BUNDLE_IMAGE" \
+    --namespace="$KMO_NS" \
+    --install-mode=OwnNamespace \
+    --security-context-config restricted
+
+  local sa
+  sa=$(oc get deployment koku-metrics-operator -n "$KMO_NS" \
+    -o jsonpath='{.spec.template.spec.serviceAccountName}')
+  if [[ "${KMO_PRIVATE_REGISTRY:-false}" == true ]]; then
+    oc -n "$KMO_NS" create secret generic kmo-registry-pull \
+      --from-file=.dockerconfigjson=/root/.config/containers/auth.json \
+      --type=kubernetes.io/dockerconfigjson --dry-run=client -o yaml | oc apply -f -
+    oc -n "$KMO_NS" secrets link "$sa" kmo-registry-pull --for=pull
+  fi
+
+  oc get subscription,csv -n "$KMO_NS"
+  local csv
+  csv=$(oc get csv -n "$KMO_NS" -o jsonpath='{range .items[?(@.status.phase=="Succeeded")]}{.metadata.name}{"\n"}{end}' \
+    | grep '^koku-metrics-operator\.' | tail -1)
+  test -n "$csv"
+  oc wait --for=jsonpath='{.status.phase}'=Succeeded "csv/$csv" \
+    -n "$KMO_NS" --timeout=300s
+  oc rollout status deployment/koku-metrics-operator -n "$KMO_NS" --timeout=300s
+
+  oc adm policy add-cluster-role-to-user cluster-monitoring-view \
+    -z "$sa" -n "$KMO_NS"
+  oc get deployment koku-metrics-operator -n "$KMO_NS" -o json \
+    | jq -e '[.metadata.ownerReferences[]? | select(.kind == "ClusterServiceVersion")] | length == 1'
+  echo "$plane: OLM CSV $csv, service account $sa"
+}
+
+if [[ "$INSTALL_MGMT" == true ]]; then
+  install_kmo_olm management "/root/.kcli/clusters/$MGMT/auth/kubeconfig"
+fi
+if [[ "$INSTALL_HOSTED" == true ]]; then
+  install_kmo_olm hosted "/root/$HOSTED-kubeconfig"
+fi
+```
+
+Set `KMO_PRIVATE_REGISTRY=true` before calling the function when the manager
+image is private. The function links the pull Secret before waiting for the
+deployment. For a recovery after a failed rollout, repeat the link manually;
+never put the registry token in this skill, chat, or an ACCESS.md file:
+
+```bash
+export KUBECONFIG="/root/.kcli/clusters/$MGMT/auth/kubeconfig"  # repeat for hosted
+sa=$(oc get deployment koku-metrics-operator -n "$KMO_NS" \
+  -o jsonpath='{.spec.template.spec.serviceAccountName}')
+oc -n "$KMO_NS" create secret generic kmo-registry-pull \
+  --from-file=.dockerconfigjson=/root/.config/containers/auth.json \
+  --type=kubernetes.io/dockerconfigjson --dry-run=client -o yaml | oc apply -f -
+oc -n "$KMO_NS" secrets link "$sa" kmo-registry-pull --for=pull
+oc rollout restart deployment/koku-metrics-operator -n "$KMO_NS"
+```
+
+##### Configure Keycloak authentication
+
+Use the same Cost Management service client on both planes, stored in a Secret
+with exactly `client_id` and `client_secret` keys. The Keycloak client must have
+the realm role `org-admin` on its service-account user
+`service-account-<client-id>`—granting the role only to a human test user does
+not authenticate the operator.
+
+```bash
+# [hypervisor] client credentials are supplied by the human, never echoed
+CLIENT_ID=<cost-management-operator-client-id>
+CLIENT_SECRET=<cost-management-operator-client-secret>
+
+for kubeconfig in \
+  $([[ "$INSTALL_MGMT" == true ]] && echo "/root/.kcli/clusters/$MGMT/auth/kubeconfig") \
+  $([[ "$INSTALL_HOSTED" == true ]] && echo "/root/$HOSTED-kubeconfig"); do
+  [[ -n "$kubeconfig" ]] || continue
+  export KUBECONFIG="$kubeconfig"
+  oc -n "$KMO_NS" create secret generic cost-management-auth-secret \
+    --from-literal=client_id="$CLIENT_ID" \
+    --from-literal=client_secret="$CLIENT_SECRET" \
+    --dry-run=client -o yaml | oc apply -f -
+done
+
+# Token endpoint: ${KC}/realms/${REALM}/protocol/openid-connect/token
+# Assign realm role org-admin to service-account-${CLIENT_ID}. ADMIN_TOKEN is
+# obtained from the Keycloak admin Secret; never put it in this document.
+CLIENT_UUID=$(curl -skS --fail -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$KC/admin/realms/$REALM/clients?clientId=$CLIENT_ID" | jq -er '.[0].id')
+SA_ID=$(curl -skS --fail -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$KC/admin/realms/$REALM/users?username=service-account-$CLIENT_ID" \
+  | jq -er 'map(select(.username == "service-account-'"$CLIENT_ID"'"))[0].id')
+ORG_ADMIN_ROLE=$(curl -skS --fail -H "Authorization: Bearer $ADMIN_TOKEN" \
+  "$KC/admin/realms/$REALM/roles/org-admin")
+curl -skS --fail-with-body -X POST \
+  -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
+  "$KC/admin/realms/$REALM/users/$SA_ID/role-mappings/realm" \
+  -d "[$ORG_ADMIN_ROLE]"
+
+# Verify the client-credentials JWT contains org-admin.
+TOKEN=$(curl -skS --fail "$KC/realms/$REALM/protocol/openid-connect/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_id="$CLIENT_ID" \
+  --data-urlencode client_secret="$CLIENT_SECRET" | jq -er .access_token)
+python3 - "$TOKEN" <<'PY'
+import base64, json, sys
+payload = sys.argv[1].split('.')[1]
+payload += '=' * (-len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload))
+print('issuer=', claims.get('iss'))
+print('org_admin=', 'org-admin' in claims.get('realm_access', {}).get('roles', []))
+PY
+```
+
+When the Cost Management chart has `rbac.enabled: false`, set
+`ENHANCED_ORG_ADMIN=True` in its values. This lets Koku authorize the operator
+from `X-Rh-Identity.is_org_admin` without calling a missing RBAC API. The
+operator's `org-admin` role and Koku's enhanced-admin setting are separate
+requirements.
+
+##### Apply one authenticated CR per plane
+
+Use unique source names; Cost Management source names are global to the
+destination stack. `create_source: true` is correct for first registration.
+Use `check_cycle: 1` during bootstrap so a failed first check does not make
+reports wait a day; restore the normal interval after `source_defined=true`.
+
+```bash
+apply_kmo_cr() {
+  local plane=$1 kubeconfig=$2 source_name=$3 cr_name=$4
+  export KUBECONFIG="$kubeconfig"
+  oc apply -f - <<YAML
+apiVersion: costmanagement-metrics-cfg.openshift.io/v1beta1
+kind: CostManagementMetricsConfig
+metadata:
+  name: ${cr_name}
+  namespace: ${KMO_NS}
+spec:
+  api_url: ${CM_GATEWAY}
+  authentication:
+    type: service-account
+    secret_name: cost-management-auth-secret
+    token_url: ${KC}/realms/${REALM}/protocol/openid-connect/token
+  packaging:
+    max_reports_to_store: 30
+    max_size_MB: 100
+  prometheus_config:
+    collect_previous_data: true
+    context_timeout: 120
+    service_address: https://thanos-querier.openshift-monitoring.svc:9091
+    skip_tls_verification: true
+  source:
+    name: ${source_name}
+    create_source: true
+    check_cycle: 1
+    sources_path: /api/cost-management/v1/
+  upload:
+    ingress_path: /api/ingress/v1/upload
+    upload_cycle: 60
+    upload_toggle: true
+    validate_cert: false
+YAML
+  echo "$plane: applied $cr_name with source $source_name"
+}
+
+if [[ "$INSTALL_MGMT" == true ]]; then
+  apply_kmo_cr management "/root/.kcli/clusters/$MGMT/auth/kubeconfig" \
+    "${MGMT}-management" "${MGMT}-cost-metrics"
+fi
+if [[ "$INSTALL_HOSTED" == true ]]; then
+  apply_kmo_cr hosted "/root/$HOSTED-kubeconfig" \
+    "${HOSTED}-hosted" "${HOSTED}-cost-metrics"
+fi
+```
+
+##### Verify auth, source routing, and upload on each plane
+
+The compatibility endpoints must be rooted at `CM_API`. A 403 from
+`$CM_API/sources/source_types` is a path error; the operator appends
+`source_types`, `application_types`, and `sources` to `sources_path` itself.
+
+```bash
+for path in source_types application_types sources; do
+  curl -skS --fail -o "/tmp/${path}.json" -w "${path}_http=%{http_code}\n" \
+    -H "Authorization: Bearer $TOKEN" "$CM_API/$path"
+done
+
+for kubeconfig in \
+  $([[ "$INSTALL_MGMT" == true ]] && echo "/root/.kcli/clusters/$MGMT/auth/kubeconfig") \
+  $([[ "$INSTALL_HOSTED" == true ]] && echo "/root/$HOSTED-kubeconfig"); do
+  [[ -n "$kubeconfig" ]] || continue
+  export KUBECONFIG="$kubeconfig"
+  oc get costmanagementmetricsconfig -n "$KMO_NS" -o json \
+    | jq '.items[] | {name:.metadata.name, commit:.status.operator_commit, prometheus:.status.prometheus.prometheus_connected, source:.status.source, upload:.status.upload}'
+done
+```
+
+Completion requires, for every selected plane: CSV `Succeeded`, deployment
+Ready and CSV-owned, `prometheus_connected=true`, `source_defined=true`, and a
+non-empty `last_successful_upload_time` with `last_upload_status="202 Accepted"`.
+
+Troubleshoot in this order:
+
+1. `source_types` is 403: set `sources_path` exactly to
+   `/api/cost-management/v1/`; do not add `/sources/`.
+2. `sources` is 424: verify `org-admin` in the client-credentials token and
+   `ENHANCED_ORG_ADMIN=True`, or deploy a healthy RBAC API.
+3. Koku logs show `account=None`, `org_id=None`, `username=None`, or
+   `is_admin=False`: inspect the Cost Management gateway `JWT auth ok` log and
+   Koku identity parsing; do not guess at header casing.
+4. Source exists but `source_defined=false`: inspect `last_check_time`, set
+   `check_cycle: 1`, reconcile, then restore the normal interval. If a timed-out
+   retry created the source, set `create_source: false` before reconciling.
+5. Source POST times out while Koku migrations run: wait for API readiness; it
+   is not necessarily an authentication failure.
+
+#### Phase 10b: air-gapped hosted validation
+
+This alternative validates the `koku-metrics-operator` end to end on the hosted
+cluster without Cost Management authentication or uploads:
 native arm64 build → air-gapped deploy → ROS CSV rows → downloadable package
 → recommendations via `robne`. Proven 2026-09-27 on `hc01`
 (`pgarciaq-rosocp-superpowers-phase17`, image
@@ -692,9 +1004,15 @@ MCE/hcp versions, what was off-matrix).
 | PVCs Pending / `mkdir: Permission denied` | Missing `chcon -Rt container_file_t` on the local-path dir |
 | `/` filesystem fills during assisted-service install | local-path `nodePath` defaults to `/opt` on `/` — relocate (Phase 3) |
 | No ROS rows / empty collection | HCP namespaces lack the label; check CR status message first |
-| Operator pod `Pending`: `unbound immediate PersistentVolumeClaims` | Hosted cluster has no StorageClass (Agent HCP ships none) — provision local-path on hosted first (Phase 10) |
+| Operator pod `Pending`: `unbound immediate PersistentVolumeClaims` | Hosted cluster has no StorageClass (Agent HCP ships none) — provision local-path on hosted first (Phase 10b) |
 | `local-path-provisioner` CrashLoop / no space on hosted workers | `/opt` default is unusable — RHCOS `/` is a ~6 MB composefs; nodePath must be under `/var` |
 | `oc exec` on the operator pod fails (`sh` not found) | Distroless image — inspect/download via the volume-shell pod instead |
+| OLM CSV `Failed` or manager image pull error | Bundle CSV points at a mutable/unreachable image; use the pushed manager digest and link a pull Secret to the OLM deployment service account |
+| `source_types` returns HTTP 403 | CR has `sources_path: /api/cost-management/v1/sources/`; use the API root `/api/cost-management/v1/` |
+| Sources API returns HTTP 424 | Client-credentials token lacks `org-admin`, or Cost Management RBAC is unavailable without `ENHANCED_ORG_ADMIN=True` |
+| Koku logs show no account/org identity | Verify gateway `JWT auth ok`, token realm/role, and Koku identity parsing before changing header casing |
+| Source exists but CR remains `source_defined=false` | Stale `last_check_time`; temporarily set `check_cycle: 1`, reconcile, then restore the normal interval |
+| Source POST times out during Koku upgrade | Koku migrations are still running; wait for API readiness before diagnosing authentication |
 | `verify you have provided the correct credentials` on `podman push` | Human hasn't run `podman login quay.io` on the box, or robot lacks Write on the repo |
 | `oc login ... -u kubeadmin` 401 on mgmt after touching the secret | Deleting `kube-system/kubeadmin` cascade-deletes User/Group/CRB and the operator won't recreate them — see runbook Known issue |
 | Namespace plugin returns 0 recommendations, 0 skipped | Expected on a fresh lab — short term needs 1 day minimum data |

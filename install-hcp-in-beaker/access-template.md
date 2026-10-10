@@ -82,11 +82,54 @@ sshuttle -r root@{{HYPERVISOR_FQDN}} 192.168.122.0/24
 oc login https://api.{{MGMT_NAME}}.{{BASE_DOMAIN}}:6443 -u kubeadmin -p '{{MGMT_KUBEADMIN}}'
 \`\`\`
 
-## Operator images (if deployed)
+## Metrics operator (authenticated OLM mode, if deployed)
 
-Robot `{{QUAY_ROBOT}}` (push on `{{QUAY_REPO}}`, private). Token ONLY in
-root's `podman login` on the hypervisor. Tags unique per build
-(`{{TAG_SCHEME}}`). Current: `{{CURRENT_TAG}}` on both planes.
+The operator is installed independently in each target cluster. It runs on
+that cluster's workers; it is not installed separately on each worker VM.
+
+| Plane | Kubeconfig | Subscription / CSV | CR | Source | Last upload |
+|-------|------------|--------------------|----|--------|-------------|
+| Management | `/root/.kcli/clusters/{{MGMT_NAME}}/auth/kubeconfig` | `{{MGMT_KMO_SUBSCRIPTION}}` / `{{MGMT_KMO_CSV}}` | `{{MGMT_KMO_CR}}` | `{{MGMT_KMO_SOURCE}}` | `{{MGMT_KMO_UPLOAD}}` |
+| Hosted | `/root/{{HOSTED_NAME}}-kubeconfig` | `{{HOSTED_KMO_SUBSCRIPTION}}` / `{{HOSTED_KMO_CSV}}` | `{{HOSTED_KMO_CR}}` | `{{HOSTED_KMO_SOURCE}}` | `{{HOSTED_KMO_UPLOAD}}` |
+
+Namespace: `koku-metrics-operator`. Both CSVs must be `Succeeded` and own their
+deployment. Each CR uses `sources_path: /api/cost-management/v1/`, a unique
+source name, and the Keycloak `cost-management` realm. The auth Secret in each
+cluster contains only `client_id` and `client_secret`; the client-credentials
+service-account user has the `org-admin` realm role.
+
+| Field | Value |
+|-------|-------|
+| Manager image tag | `{{CURRENT_TAG}}` |
+| Manager image digest | `{{KMO_IMAGE_DIGEST}}` |
+| Bundle image | `{{KMO_BUNDLE_IMAGE}}` |
+| Operator commit | `{{KMO_SHA_FULL}}` |
+| Auth Secret | `{{KMO_AUTH_SECRET}}` in each operator namespace |
+| Token URL realm | `cost-management` |
+| Sources path | `/api/cost-management/v1/` |
+| Cost Management gateway | `{{COST_MANAGEMENT_GATEWAY}}` |
+| RBAC mode | `rbac.enabled=false`, `ENHANCED_ORG_ADMIN=True` when RBAC is absent |
+
+Verify each plane:
+
+```bash
+oc get subscription,csv -n koku-metrics-operator
+oc get costmanagementmetricsconfig -n koku-metrics-operator {{MGMT_KMO_CR}} \
+  -o jsonpath='commit={.status.operator_commit}{"\n"}prom={.status.prometheus.prometheus_connected}{"\n"}source={.status.source.source_defined}{"\n"}uploaded={.status.upload.last_successful_upload_time}{"\n"}status={.status.upload.last_upload_status}{"\n"}'
+# Repeat with the hosted kubeconfig and {{HOSTED_KMO_CR}}.
+```
+
+## Metrics operator (air-gapped validation mode, if deployed)
+
+This is mutually exclusive with authenticated OLM mode. It uses direct
+kustomize deployment on the hosted cluster, empty authentication, and
+`upload_toggle: false`; it validates collection/package contents locally only.
+
+## Operator images
+
+Robot `{{QUAY_ROBOT}}` (push on `{{QUAY_REPO}}`, private). Token ONLY in root's
+`podman login` on the hypervisor. The manager image and OLM bundle/catalog use
+unique tags (`{{TAG_SCHEME}}`) and the CSV records the manager image digest.
 
 ## kcli management (from hypervisor)
 
