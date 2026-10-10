@@ -35,8 +35,9 @@ workers) on the Agent platform. {{SUPPORT_NOTE}}
 | Console | `https://console-openshift-console.apps.{{MGMT_NAME}}.{{BASE_DOMAIN}}` |
 | Kubeadmin | `{{MGMT_KUBEADMIN}}` |
 | Kubeconfig (box) | `/root/.kcli/clusters/{{MGMT_NAME}}/auth/kubeconfig` |
-| MCE | {{MCE_CHANNEL}} (`hcp` CLI at `/root/hcp`) |
-| Storage | `{{STORAGECLASS}}` (default) |
+| MCE | {{MCE_CHANNEL}} (CSV `{{MCE_CSV}}`, **{{MCE_INSTALL_MODE}}** — console plugin not served), `hcp` CLI at `/root/hcp` ({{HCP_CLI_VERSION}}) |
+| Storage | `{{STORAGECLASS}}` (default, `nodePath={{LPP_NODEPATH}}`) |
+| NTP | {{NTP_NOTE}} |
 
 ## Hosted cluster `{{HOSTED_NAME}}`
 
@@ -52,13 +53,26 @@ workers) on the Agent platform. {{SUPPORT_NOTE}}
 | Infra namespace | `{{INFRA_NAMESPACE}}` |
 | Secrets (mgmt ns) | `{{HOSTED_NAME}}-pull-secret`, `{{HOSTED_NAME}}-ssh-key`, `{{HOSTED_NAME}}-etcd-encryption-key` |
 
-## DNS (explicit records on all three layers — no wildcards)
+## DNS (explicit records on all three layers — no real DNS)
 
 | Name | IP | Why |
 |------|----|-----|
 | `api.{{MGMT_NAME}}…`, `*.apps.{{MGMT_NAME}}…`, assisted hostnames | {{API_VIP}} | mgmt serving endpoint |
 | `api.{{HOSTED_NAME}}…`, `api-int.{{HOSTED_NAME}}…` | {{API_VIP}} | hosted API NodePort |
-| `console/oauth/canary .apps.{{HOSTED_NAME}}…` | {{ROUTER_WORKER_IP}} | hosted HostNetwork router (DHCP — re-check on rebuild) |
+| **`*.apps.{{HOSTED_NAME}}…`** (wildcard — mandatory) plus `console/oauth/canary .apps.{{HOSTED_NAME}}…` | {{ROUTER_WORKER_IP}} | hosted HostNetwork router (DHCP — re-check on rebuild) |
+
+The hosted `*.apps.{{BASE_DOMAIN}}` wildcard is what the assisted agent
+validates; without it the workers never install. After any `virsh net-update`,
+`kill -HUP` dnsmasq. Verify guest-side with
+`oc debug node/<n> -- chroot /host getent hosts <name>` (`dig`/`nslookup`/`host`
+are not installed on a stock box, and empty output from them means *not
+installed*, not NXDOMAIN).
+
+## Deviations from the skill (record what you hit)
+
+Anything you had to change, with the symptom it caused. Future runs read this
+section first — see the "Deviations" list in `SKILL.md` for the 4.22-era
+entries, and add new ones here as you find them.
 
 ## Laptop access
 
