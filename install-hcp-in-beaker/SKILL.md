@@ -389,6 +389,18 @@ specific worker (`oc -n $INFRA get agent -o jsonpath='{..status.inventory.interf
 then confirm the router's `hostIP` after install
 (`oc -n openshift-ingress get pod -o custom-columns=POD:.metadata.name,NODE:.spec.nodeName,HOSTIP:.status.hostIP --no-headers`).
 
+**Run 2 router replicas, not 1.** A single-replica HostNetwork router floats
+between workers whenever its pod is replaced; DNS pinned to one worker IP
+then blackholes the console and canary checks. Observed 2026-10-10: hc01's
+lone router moved worker-0 → worker-1 while DNS answered only .218, and the
+console operator reported `dial tcp 192.168.122.218:443: connection refused`
+with all console pods healthy. Fix: `oc -n openshift-ingress-operator patch
+ingresscontroller default --type merge -p '{"spec":{"replicas":2}}'` on each
+hosted cluster at birth, and keep **every** router-worker's IP in the DNS
+blocks (both IPs must serve :443). HCP does not revert the replica count
+(verified 26h+ on hc02). Never prune DNS down to a single worker IP while a
+single router replica exists.
+
 ```bash
 # [hypervisor] VIP block — one <host> element holding every VIP-served name.
 # Use `modify` to replace an IP's existing block, `add-last` to create a new one
@@ -1017,3 +1029,4 @@ MCE/hcp versions, what was off-matrix).
 | `oc login ... -u kubeadmin` 401 on mgmt after touching the secret | Deleting `kube-system/kubeadmin` cascade-deletes User/Group/CRB and the operator won't recreate them — see runbook Known issue |
 | Namespace plugin returns 0 recommendations, 0 skipped | Expected on a fresh lab — short term needs 1 day minimum data |
 | `oc cp` fails in helper pod | ubi-minimal has no `tar` |
+| Console/ingress dead, `connection refused` on the old router IP, console pods healthy | Single router replica rescheduled to the other worker while DNS names only the old IP — scale routers to 2 and keep both worker IPs in DNS (Phase 8) |
