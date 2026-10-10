@@ -44,17 +44,23 @@ Also build (Phase 6, same unique tag):
 
 | Issue | Fix |
 |-------|-----|
-| OLM CSV image patch | Do **not** — upstream `NamePrefix=koku` expects Deployment `koku-metrics-operator`; OLM uses `costmanagement-metrics-operator` |
-| Wrong binary path in CSV | Downstream expects `/usr/bin/costmanagement-metrics-operator`; upstream image has `/manager` |
+| OLM CSV image patch | Do **not** hand-edit the CSV; publish the current-branch image through the OLM bundle/catalog and verify CSV `Succeeded` |
+| Two operator deployments | Stop the old kustomize deployment before OLM reconciliation; exactly one operator may own the CR |
 | Keycloak realm `kubernetes` | Use `.../realms/cost-management/protocol/openid-connect/token` |
-| Stale leader lease after rollout | `oc delete lease 91c624a5.openshift.io -n koku-metrics-operator` |
+| Stale leader lease after rollout | `oc get lease -n koku-metrics-operator`, then remove only the stale lease identified for this installation |
 | ImagePull auth from other project | Grant `system:image-puller` to `koku-metrics-controller-manager` on the image ns |
 | Prometheus queries denied | `oc adm policy add-cluster-role-to-user cluster-monitoring-view -z koku-metrics-controller-manager -n koku-metrics-operator` |
-| Upload deferred / source 424 | Operator SA missing Keycloak `org-admin`, or RBAC not deployed. On aarch64 build `containers/insights-rbac.Dockerfile.ubi9` (not upstream Dockerfile / Quay amd64) |
+| `source_types` returns 403 | `sources_path` is wrong. Use exactly `/api/cost-management/v1/`; do not use `/api/cost-management/v1/sources/` |
+| Upload deferred / source 424 | Verify client-credentials JWT has `org-admin`; with `ENHANCED_ORG_ADMIN=True`, Koku can bypass the absent RBAC API. Otherwise deploy healthy RBAC |
+| Koku logs show `account=None`, `org_id=None`, `is_admin=False` | Trace gateway `JWT auth ok` → generated identity → Koku identity parsing; do not guess at header casing |
+| Source exists but `source_defined=false` | Check stale `last_check_time`; temporarily set `check_cycle: 1`, reconcile, then restore the normal interval |
+| Source POST times out | Check whether Koku database migrations are still running; wait for readiness before treating it as auth failure |
 | Upstream insights-rbac arm64 broken | `COPY /usr/lib64` into `hi/core-runtime` → bash stack smash; use UBI9 single-stage Dockerfile |
 | Operator patches own Deployment volumes | Expects a brief rollout; wait for Ready + clear lease if stuck |
 
-Deploy path: remove OLM → `make deploy IMG=...` into ns `koku-metrics-operator` → auth secret → CR → verify `status.operator_commit`.
+Deploy path: build/push image + OLM bundle/catalog → Subscription in
+`koku-metrics-operator` → auth Secret → CR → verify CSV owner,
+`status.operator_commit`, source status, and successful upload.
 
 ## S3 Buckets (exact names)
 
@@ -81,6 +87,8 @@ No ODF: set `objectStorage.endpoint` to
 | "Account is not fully set up" | Delete/recreate user; do not add org_id as managed profile attrs |
 
 `insights-rbac` is amd64-only → `rbac.enabled: false` + `ENHANCED_ORG_ADMIN`.
+The role must be on the Keycloak service-account user, not only the human test
+user. Verify `realm_access.roles` in the client-credentials token.
 
 ## Helm / Scripts
 
@@ -126,9 +134,14 @@ vars and can produce empty output).
 - [ ] `/etc/hosts` has registry + app routes
 - [ ] RHBK hostnames are `https://...`
 - [ ] `ADMIN_EDIT` unmanaged attrs; `org_id=1234567`
+- [ ] Operator Secret has `client_id` + `client_secret`; token realm is `cost-management`
+- [ ] Client-credentials token contains `org-admin`; gateway/Koku identity logs are consistent
+- [ ] CR `source.sources_path` is exactly `/api/cost-management/v1/`
 - [ ] Three S3 buckets with exact names
 - [ ] Storage credentials secret exists
 - [ ] Helm install with absolute values path
 - [ ] Restart Koku API after first tenant; flush Valkey
-- [ ] Metrics operator via upstream kustomize (not OLM); CR token_url realm `cost-management`
+- [ ] Metrics operator via upstream OLM; CSV `Succeeded` and Deployment owned by CSV
+- [ ] CR token_url realm `cost-management`; `source_types`, `sources` return 200
+- [ ] `source_defined=true` and `last_successful_upload_time` is populated
 - [ ] `status.operator_commit` matches branch SHA; prometheus connected

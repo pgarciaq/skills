@@ -63,21 +63,23 @@ curl -sk -H "Authorization: Bearer ${JWT}" \
 
 | Field | Value |
 |-------|-------|
-| Namespace | `koku-metrics-operator` (upstream kustomize; not OLM) |
-| CR | `costmanagementmetricscfg-tls` |
-| Auth | service-account secret `cost-management-auth-secret` |
+| Namespace | `koku-metrics-operator` (upstream OLM-managed) |
+| CSV | `{{KMO_CSV}}` (`Succeeded`) |
+| CR | `{{KMO_CR}}` |
+| Auth | service-account Secret `{{KMO_AUTH_SECRET}}` (`client_id` + `client_secret`) |
 | token_url realm | `cost-management` |
 | operator_commit | `{{KMO_SHA_FULL}}` |
+| sources_path | `/api/cost-management/v1/` |
 
 ```bash
-oc get costmanagementmetricsconfig -n koku-metrics-operator costmanagementmetricscfg-tls \
-  -o jsonpath='{.status.operator_commit}{"\n"}{.status.prometheus.prometheus_connected}{"\n"}{.status.upload.error}{"\n"}'
+oc get costmanagementmetricsconfig -n koku-metrics-operator {{KMO_CR}} \
+  -o jsonpath='commit={.status.operator_commit}{"\n"}prom={.status.prometheus.prometheus_connected}{"\n"}source={.status.source.source_defined}{"\n"}uploaded={.status.upload.last_successful_upload_time}{"\n"}error={.status.upload.error}{"\n"}'
 ```
 
 ### Notes
 
-- RBAC disabled; Koku `ENHANCED_ORG_ADMIN=True`
+- RBAC disabled; Koku `ENHANCED_ORG_ADMIN=True`; operator service-account token has `org-admin`
 - Object storage: {{STORAGE_BACKEND}} (buckets: `insights-upload-perma`, `koku-bucket`, `ros-data`)
 - Hypervisor values/chart path: `/root/cost-onprem-chart/`
-- Metrics operator source/upload may need a manually registered OCP source when RBAC API is unavailable
+- Metrics operator source/upload: verify `/source_types` and `/sources` from the API root; do not use `/sources/source_types`
 ```

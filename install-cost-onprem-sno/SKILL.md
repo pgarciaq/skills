@@ -1,12 +1,9 @@
 ---
 name: install-cost-onprem-sno
 description: >-
-  Install Cost Management on-prem on a Single-Node OpenShift (SNO) cluster
-  from the user's current local git branches. Builds arm64/amd64 images,
-  pushes to the cluster registry, deploys via the cost-onprem Helm chart,
-  and installs koku-metrics-operator from the current branch (upstream
-  kustomize, not OLM). Use when the user asks to install, deploy, or
-  redeploy cost-onprem / Cost Management on SNO, Apollo, or Beaker OpenShift.
+  Use when the user asks to install, deploy, or redeploy Cost Management
+  on-prem on an existing Single-Node OpenShift cluster, including SNO, Apollo,
+  or Beaker OpenShift, using local branches and cluster-local images.
 disable-model-invocation: true
 ---
 
@@ -27,7 +24,7 @@ branch so the cluster collects and uploads OCP/ROS metrics into the stack.
 | Namespace | No | `cost-onprem` |
 | Image tag | No | `branch-$(date -u +%Y%m%d%H%M)` |
 | Enable Kruize | No | `false` (native ROS engine) |
-| Install metrics operator | No | `true` |
+| Install metrics operator through OLM | No | `true` |
 | Values file | No | `sno-arm64-values.yaml` (arm64) or `openshift-values.yaml` (amd64) |
 | Run chart tests after deploy | No | `false` |
 
@@ -50,11 +47,20 @@ Ask for any missing required parameter. Infer cluster name / hypervisor from
    `20-systemd-ssh-proxy.conf` breaks sshuttle/ssh on some laptops). Request
    `full_network` / `all` for every Shell call that hits the hypervisor or cluster.
 5. For aarch64 pitfalls, read [reference.md](reference.md) before deploying.
-6. **Metrics operator: upstream kustomize, not OLM CSV patch.** Upstream
-   `NamePrefix = "koku"`; OLM/downstream deploy is named
-   `costmanagement-metrics-operator`. Patching the CSV binary path fails
-   reconcile. Remove OLM Subscription/CSV and `make deploy` into
-   `koku-metrics-operator`.
+6. **Metrics operator: upstream OLM, not an unmanaged kustomize deployment.**
+   Build the current-branch operator image and bundle/catalog, install or
+   update the Subscription, and wait for CSV `Succeeded`. Never patch a CSV's
+   binary path or run a second kustomize-managed operator beside the OLM one.
+   Preserve any existing CR, auth Secret, and PVC before an operator migration.
+7. **Sources API path is the compatibility API root.** Set
+   `sources_path: /api/cost-management/v1/` (including the trailing slash).
+   The operator appends `source_types`, `application_types`, and `sources` to
+   this root. Do not use `/api/cost-management/v1/sources/`; that makes
+   `source_types` resolve to the protected Sources view and returns 403.
+8. **Prove auth at each boundary.** A valid Keycloak token is not enough:
+   verify the token's realm and `org-admin` role, the gateway's JWT-auth log,
+   Koku's parsed identity log, and 200 responses from the compatibility
+   endpoints before diagnosing upload failures.
 
 ## Repos (current branches)
 
@@ -91,7 +97,7 @@ Task Progress:
 - [ ] Phase 3: Update values file with image tags
 - [ ] Phase 4: Deploy infra (RHBK, Kafka, S3) + Helm chart
 - [ ] Phase 5: Post-install fixes + smoke check
-- [ ] Phase 6: Deploy koku-metrics-operator from branch
+- [ ] Phase 6: Install/update OLM-managed koku-metrics-operator from branch
 - [ ] Phase 7: Update ACCESS.md; report credentials
 ```
 
@@ -275,38 +281,45 @@ cluster). If using a split flow:
    curl -sk https://cost-onprem-gateway-cost-onprem.apps.CLUSTER.karmalabs.corp/api/cost-management/v1/status/
    ```
 
-### Phase 6: Deploy koku-metrics-operator From Branch
+### Phase 6: Install OLM-Managed koku-metrics-operator From Branch
 
-Skip only if the user set **Install metrics operator = false**. This is **not**
-part of the Helm chart; deploy upstream via kustomize after cost-onprem is up.
+Skip only if the user set **Install metrics operator through OLM = false**. This
+is **not** part of the Helm chart. Build the upstream operator from the current
+branch, publish its image and OLM bundle/catalog, then install it through OLM
+after cost-onprem is up.
 
-#### 6a. Remove OLM/downstream install (if present)
+#### 6a. Preserve existing operator state
 
-Do **not** patch the OLM CSV image. Upstream looks for Deployment
-`koku-metrics-operator` (`NamePrefix = "koku"`); OLM installs
-`costmanagement-metrics-operator`.
+Before changing the operator, save the existing CR, auth Secret, and PVC. Do
+not delete an existing OLM Subscription/CSV merely to replace the image; update
+the catalog or Subscription and let OLM roll the Deployment. If a previous
+kustomize deployment exists, stop it only after confirming the OLM deployment
+will own the CR and there will be exactly one active reconciler.
 
 ```bash
-# Save existing CR + auth secret first (if any)
-OLM_NS=costmanagement-metrics-operator
-oc get costmanagementmetricsconfig -n "$OLM_NS" -o yaml > /tmp/kmo-migrate/cr.yaml 2>/dev/null || true
-oc get secret cost-management-auth-secret -n "$OLM_NS" -o yaml > /tmp/kmo-migrate/auth-secret.yaml 2>/dev/null || true
-
-oc delete subscription -n "$OLM_NS" --all --ignore-not-found
-oc delete csv -n "$OLM_NS" --all --ignore-not-found
-# Optional: leave old ns/PVC for later cleanup; do not run two operators
+mkdir -p /tmp/kmo-migrate
+oc get costmanagementmetricsconfig -n koku-metrics-operator -o yaml \
+  > /tmp/kmo-migrate/cr.yaml 2>/dev/null || true
+oc get secret -n koku-metrics-operator cost-mgmt-operator-keycloak -o yaml \
+  > /tmp/kmo-migrate/auth-secret.yaml 2>/dev/null || true
+oc get pvc -n koku-metrics-operator koku-metrics-operator-data -o yaml \
+  > /tmp/kmo-migrate/pvc.yaml 2>/dev/null || true
 ```
 
-#### 6b. Deploy upstream operator
+#### 6b. Build and install the upstream OLM bundle
 
 ```bash
 export KUBECONFIG=/root/.kcli/clusters/CLUSTER/auth/kubeconfig
 cd /root/koku-metrics-operator
 
 IMG_INT="image-registry.openshift-image-registry.svc:5000/cost-onprem/koku-metrics-operator:${TAG}"
-# Prefer make deploy (sets image via kustomize). Ensure kustomize/yq available.
-cd config/default && kustomize edit set namespace "koku-metrics-operator" && cd ../..
-make deploy IMG="${IMG_INT}"
+# Build/push IMG_INT, resolve its immutable digest, then use the repository's
+# `bundle`, `bundle-build`, `bundle-push`, and `bundle-deploy` targets (or the
+# equivalent catalog workflow) from this checkout. Install/update the
+# CatalogSource and Subscription in koku-metrics-operator; do not hand-edit the
+# CSV. The generated CSV must reference IMG_INT by digest, not a mutable tag.
+
+oc get subscription,csv -n koku-metrics-operator
 
 oc adm policy add-cluster-role-to-user cluster-monitoring-view \
   -z koku-metrics-controller-manager -n koku-metrics-operator
@@ -316,27 +329,34 @@ oc adm policy add-role-to-user system:image-puller \
   -n cost-onprem
 
 oc rollout status deployment/koku-metrics-operator -n koku-metrics-operator --timeout=180s
+oc get deployment koku-metrics-operator -n koku-metrics-operator -o json \
+  | jq -e '[.metadata.ownerReferences[]? | select(.kind == "ClusterServiceVersion")] | length == 1'
 ```
 
-If the pod sits on leader election after a rollout, delete the stale lease:
+If the pod sits on leader election after an OLM rollout, inspect the lease and
+delete only the stale lease identified for this installation; do not assume a
+fixed lease name:
 
 ```bash
-oc delete lease 91c624a5.openshift.io -n koku-metrics-operator --ignore-not-found
+oc get lease -n koku-metrics-operator
 ```
 
 #### 6c. Auth secret + CostManagementMetricsConfig
 
-Create/copy `cost-management-auth-secret` into `koku-metrics-operator` with
-`client_id` + `client_secret` for the Keycloak client
-`cost-management-operator` (or the cluster’s existing operator client).
+Create/copy the operator auth Secret into `koku-metrics-operator` with exactly
+the `client_id` and `client_secret` keys for the Keycloak client
+`cost-management-operator` (or the cluster’s existing operator client). Keep
+the Secret name used by the CR; the upstream operator does not read arbitrary
+environment variables.
 
 **Required on aarch64 (`rbac.enabled: false`):** grant the Keycloak realm
 role `org-admin` to the operator client’s **service account** user
 (`service-account-cost-management-operator`). The gateway sets
 `X-Rh-Identity.is_org_admin` from that role; with `ENHANCED_ORG_ADMIN=True`,
 Koku then skips calling `cost-onprem-rbac-api` (which is not deployed).
-Without `org-admin`, Sources API returns **424 Rbac unavailable** and the
-operator will never upload.
+Without `org-admin`, protected Sources operations can fail with **424 Rbac
+unavailable** when RBAC is disabled. A 403 from `source_types` usually means
+the operator is using the wrong path, not that the role is missing.
 
 ```bash
 # After Keycloak realm exists — assign org-admin to operator SA
@@ -356,20 +376,20 @@ hypervisor, push to the SNO registry, then set `rbac.enabled: true` and
 `ENHANCED_ORG_ADMIN: "False"`. Upstream `Dockerfile` (hi/core-runtime + full
 `/usr/lib64` copy) produces a broken arm64 image (bash stack smash).
 
-Apply a CR (migrate saved one, or create fresh). **Must** use realm
-`cost-management` (not `kubernetes`):
+Apply a CR (migrate the saved one, or create fresh). **Must** use realm
+`cost-management` (not `kubernetes`) and the compatibility API root below:
 
 ```yaml
 apiVersion: costmanagement-metrics-cfg.openshift.io/v1beta1
 kind: CostManagementMetricsConfig
 metadata:
-  name: costmanagementmetricscfg-tls
+  name: costmanagementmetricscfg
   namespace: koku-metrics-operator
 spec:
   api_url: https://cost-onprem-gateway-cost-onprem.apps.CLUSTER.karmalabs.corp
   authentication:
     type: service-account
-    secret_name: cost-management-auth-secret
+    secret_name: cost-mgmt-operator-keycloak
     token_url: https://keycloak-keycloak.apps.CLUSTER.karmalabs.corp/realms/cost-management/protocol/openid-connect/token
   packaging:
     max_reports_to_store: 30
@@ -383,7 +403,10 @@ spec:
     skip_tls_verification: false
   source:
     create_source: true
-    check_cycle: 1440
+    # Use a short interval during bootstrap so a failed first check does not
+    # leave reports waiting for a day. Restore the normal interval after the
+    # source is defined.
+    check_cycle: 1
     sources_path: /api/cost-management/v1/
   upload:
     ingress_path: /api/ingress/v1/upload
@@ -392,22 +415,83 @@ spec:
     validate_cert: false
 ```
 
-#### 6d. Verify
+#### 6d. Verify authentication and source routing
 
 ```bash
 EXPECTED=$(git -C /root/koku-metrics-operator rev-parse HEAD)
 oc get pods -n koku-metrics-operator
 oc get costmanagementmetricsconfig -n koku-metrics-operator \
-  costmanagementmetricscfg-tls \
+  costmanagementmetricscfg \
   -o jsonpath='commit={.status.operator_commit}{"\n"}prom={.status.prometheus.prometheus_connected}{"\n"}auth={.status.authentication.credentials_found}{"\n"}packaged={.status.packaging.number_reports_stored}{"\n"}'
 # Expect: operator_commit == $EXPECTED, prometheus_connected=true, credentials_found=true
+
+API=https://cost-onprem-gateway-cost-onprem.apps.CLUSTER.karmalabs.corp/api/cost-management/v1
+# Obtain a client-credentials token without printing it. Use the same Secret
+# and token_url referenced by the CR.
+AUTH_SECRET=cost-mgmt-operator-keycloak
+KC=https://keycloak-keycloak.apps.CLUSTER.karmalabs.corp
+CLIENT_ID=$(oc get secret "$AUTH_SECRET" -n koku-metrics-operator \
+  -o jsonpath='{.data.client_id}' | base64 -d)
+CLIENT_SECRET=$(oc get secret "$AUTH_SECRET" -n koku-metrics-operator \
+  -o jsonpath='{.data.client_secret}' | base64 -d)
+TOKEN=$(curl -skS --fail "$KC/realms/cost-management/protocol/openid-connect/token" \
+  --data-urlencode grant_type=client_credentials \
+  --data-urlencode client_id="$CLIENT_ID" \
+  --data-urlencode client_secret="$CLIENT_SECRET" | jq -er .access_token)
+# Verify only non-secret claims; do not log the token or full identity header.
+python3 - "$TOKEN" <<'PY'
+import base64, json, sys
+payload = sys.argv[1].split('.')[1]
+payload += '=' * (-len(payload) % 4)
+claims = json.loads(base64.urlsafe_b64decode(payload))
+print('issuer=', claims.get('iss'))
+print('org_admin=', 'org-admin' in claims.get('realm_access', {}).get('roles', []))
+PY
+curl -skS -o /tmp/source-types.json -w 'source_types_http=%{http_code}\n' \
+  -H "Authorization: Bearer $TOKEN" "$API/source_types?filter[name]=openshift"
+curl -skS -o /tmp/application-types.json -w 'application_types_http=%{http_code}\n' \
+  -H "Authorization: Bearer $TOKEN" "$API/application_types"
+curl -skS -o /tmp/sources.json -w 'sources_http=%{http_code}\n' \
+  -H "Authorization: Bearer $TOKEN" "$API/sources"
+# source_types and application_types must be rooted at API, not /sources/.
+# The operator's target is sources_path + {source_types,application_types,sources}.
 ```
 
-Upload may defer until a source is registered (`source.source_defined`). On
-aarch64 with `rbac.enabled: false`, source create via the API can return **424
-Rbac unavailable** (DNS to `cost-onprem-rbac-api...`). That is a stack/RBAC
-limitation — report it; do not treat the operator deploy as failed if collect +
-package succeed. Register the OCP source manually (or fix RBAC) so uploads proceed.
+Expect `source_types_http=200`, `application_types_http=200`, and
+`sources_http=200`. Then verify the CR reaches both `source_defined=true` and a
+non-empty `last_successful_upload_time`:
+
+```bash
+oc get costmanagementmetricsconfig -n koku-metrics-operator costmanagementmetricscfg -o json \
+  | jq '{source: .status.source, upload: .status.upload}'
+```
+
+If a source was manually registered or created by a timed-out retry, set
+`source.create_source: false` and reconcile against the existing source rather
+than creating a duplicate. If `source_defined=false` but the API already shows
+the source, inspect `status.source.last_check_time`; temporarily set
+`check_cycle: 1`, wait for a fresh check, then restore the normal interval.
+
+Troubleshoot in this order:
+
+1. `source_types` is 403: fix `sources_path` to exactly
+   `/api/cost-management/v1/`; never use `/api/cost-management/v1/sources/`.
+2. `sources` is 424: verify `org-admin` is in the client-credentials token and
+   either enable `ENHANCED_ORG_ADMIN=True` or deploy a healthy RBAC API.
+3. Koku logs show `account=None`, `org_id=None`, or `is_admin=False`: inspect
+   gateway `JWT auth ok` logs and Koku identity parsing; do not change header
+   casing or enable development auth without evidence. Useful redacted checks:
+   ```bash
+   oc logs -n cost-onprem -l app.kubernetes.io/component=gateway --since=5m \
+     | grep -E 'JWT auth ok|Lua filter error'
+   oc logs -n cost-onprem deployment/cost-onprem-koku-api --since=5m \
+     | grep -E 'account|org_id|username|is_admin|403|424'
+   ```
+4. POST/create times out while Koku migrations are running: wait for the API
+   migrations/readiness, then retry; this is not an authentication failure.
+
+Do not declare collection complete until the operator has both packaged data
+and uploaded at least one report successfully.
 
 ### Phase 7: ACCESS.md + Report
 
