@@ -202,6 +202,7 @@ If it doesn't, note why in the final report.
 | 9 | **Update the CHANGELOG** | Any user-visible change, new feature, fix, deprecation, or performance improvement |
 | 10 | **Update the ADR index** | When a new ADR is created — update both `docs/architecture/adr/README.md` and `docs-site/architecture/adrs.md` |
 | 11 | **Update the performance audit** | Only when the user explicitly asks to update the audit report, or when closing out a dedicated performance optimization phase |
+| 12 | **Note cross-repo dependencies** | Feature consumes or produces data across repo boundaries (operator query/column, koku endpoint/task, UI code, IQE constant, chart value) — record the counterpart repo + commit/issue in the commit message, the tracking GH issue, and the relevant docs |
 
 ### 6. Produce the completion report
 
@@ -226,7 +227,11 @@ After all tasks are done, present a summary table:
 | CHANGELOG | Done / Dismissed | reason |
 | ADR index | Done / Dismissed | reason |
 | Performance audit | Done / Dismissed | reason |
+| Cross-repo dependencies | Done / Dismissed | counterpart repos + commits/issues, or reason |
 ```
+
+Post this table as a comment on the tracking GH issue (chat history is
+ephemeral; the issue is the durable record), then also present it in chat.
 
 ## Decision guidelines
 
