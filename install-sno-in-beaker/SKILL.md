@@ -56,7 +56,7 @@ they can create OpenShift clusters.
 ssh -o StrictHostKeyChecking=no root@HYPERVISOR "
   cat /etc/redhat-release
   nproc && free -g && df -h /
-  which kcli 2>/dev/null && kcli --version || echo 'kcli not installed'
+  which kcli 2>/dev/null && kcli version || echo 'kcli not installed'
 "
 ```
 
@@ -69,12 +69,21 @@ ssh root@HYPERVISOR "
 "
 ```
 
+If RHEL 9:
+
+```bash
+ssh root@HYPERVISOR "
+  dnf install -y \
+    https://dl.fedoraproject.org/pub/epel/epel-release-latest-9.noarch.rpm
+"
+```
+
 3. **Install kcli**
 
 ```bash
 ssh root@HYPERVISOR "
   dnf -y copr enable karmab/kcli
-  dnf -y install kcli
+  dnf -y install kcli podman acl
 "
 ```
 
@@ -87,7 +96,7 @@ ssh root@HYPERVISOR "dnf -y install dnf-plugins-core"
 4. **Run kcli prerequisites** (installs libvirt, qemu-kvm, configures networking)
 
 ```bash
-ssh root@HYPERVISOR "kcli create host kvm -P pool=/home/libvirt/images"
+ssh root@HYPERVISOR "kcli create host kvm -P pool=/home/libvirt/images -H 127.0.0.1 local"
 ```
 
 This enables and starts libvirtd, creates the default network, and sets up
@@ -150,17 +159,82 @@ ssh root@HYPERVISOR "chmod 600 /root/.kcli/id_rsa"
 
 ```bash
 ssh root@HYPERVISOR "
-  kcli create cluster openshift \
+  kcli create kube openshift \
     -P sno=true \
     -P version=stable \
-    -P cpus=30 \
+    -P domain=karmalabs.corp \
+    -P numcpus=30 \
     -P memory=81920 \
     -P disk_size=300 \
     -P extra_disks=[400] \
+    -P keys=[/root/.kcli/id_rsa.pub] \
     -P pull_secret=/root/.kcli/openshift_pull.json \
     CLUSTER_NAME
 "
 ```
+
+Notes (kcli 99):
+
+- Canonical syntax is `create kube` with `numcpus`/`ctlplanes`. The old
+  `create cluster` still aliases to it, but `-P cpus=...` is **silently
+  ignored** (no `cpus` key exists in the openshift plugin) — the VM would get
+  the default 8 vCPUs instead of 30. `memory` is in MiB (81920 = 80 GiB).
+- `domain` defaults to `karmalabs.corp` in kcli; pass it explicitly so the
+  Parameters table stays truthful. `keys` defaults to empty — pass the key
+  copied in Phase 1 explicitly.
+- Do NOT add manual DNS/`/etc/hosts` entries on the hypervisor before this
+  step. Nothing you put there can fix a create-time failure (see crash box);
+  kcli manages what it can itself and prints exactly what remains afterwards.
+
+> **Known failure — kcli 99.0 Corefile crash on a fresh hypervisor.**
+> Signature: `Injecting coredns static pod as some DNS records were missing`
+> followed by `File ".../kvirt/cluster/openshift/Corefile", line 16` and
+> `TypeError: argument of type 'NoneType' is not iterable` (`apps_ip` is
+> None). Mechanism: before any VM exists, kcli probes
+> `api-int.<cluster>.<domain>`, `api...`, `xxx.apps...` via gethostbyname;
+> for `karmalabs.corp` on a fresh box (loopback-only `/etc/hosts`, empty
+> `default.addnhosts`, no leases) this always fails, so kcli takes the
+> coredns-injection path whose template requires `api_ip`/`ingress_ip` —
+> both None for DHCP SNO — and crashes. `virsh net-dhcp-leases` stays empty.
+> Status: upstream kcli bug (99.0.0.git.20261009; older 20260928–20261003
+> builds in copr are untested against this path). `-P sno_dns=false` skips
+> the crash but also skips the on-node coredns pod the install likely needs
+> — unverified, do not use as a fix. On hitting it, record `kcli version`
+> and report upstream.
+>
+> Once past the crash, kcli does NOT write the hypervisor `/etc/hosts` for
+> plain `sno=true` (no `api_ip`, no `sno_vm`) — it prints
+> `Add the following entry in /etc/hosts if needed` with
+> `api, console-openshift-console.apps, oauth-openshift.apps,
+> prometheus-k8s-openshift-monitoring.apps, rh-ai` for
+> `<cluster>.<domain>`. When you see that warning, substitute `$your_node_ip`
+> with the DHCP IP from `virsh net-dhcp-leases default`. Not yet reached on
+> kcli 99.0 due to the crash above.
+
+**Boot the node (manual path).** Plain `-P sno=true` only builds
+`CLUSTER_NAME-sno.iso` in the pool and stops — kcli's closing line is
+`Plug <cluster>-sno.iso to your SNO node to complete the installation`.
+Create the VM yourself and attach the ISO (same pattern as the HCP skill's
+worker VMs):
+
+```bash
+ssh root@HYPERVISOR "
+  kcli create vm -P memory=81920 -P numcpus=30 -P disks=[300,400] \
+    -P nets=[default] -P iso=/home/libvirt/images/CLUSTER_NAME-sno.iso \
+    CLUSTER_NAME-sno
+  virsh list --all
+"
+```
+
+Match `memory`/`numcpus`/`disks` to the values used in step 8 (first disk =
+install target, second = LVMS data disk, `/dev/vdb` in Phase 4). The VM boots
+the ISO, installs to the first disk, and reboots; take its DHCP IP from
+`virsh net-dhcp-leases default` for the `/etc/hosts` entry above.
+
+Alternative (single step, unverified on this flow): add `-P sno_vm=true` to
+the step 8 command and kcli provisions the `CLUSTER_NAME-sno` VM itself
+instead of stopping at the ISO. Prefer the manual path until someone verifies
+`sno_vm=true` end to end on kcli 99.
 
 This takes 30-60 minutes. Use `block_until_ms: 0` and monitor with
 `notify_on_output` matching `cluster.*ready|installed|error|failed`.
